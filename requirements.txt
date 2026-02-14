@@ -1,0 +1,7 @@
+pyaudio
+numpy
+python-dotenv
+deepgram-sdk
+groq
+cartesia
+websockets
