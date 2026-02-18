@@ -6,6 +6,8 @@ import numpy as np
 import json
 import websockets
 import time
+import re
+import uuid
 from dotenv import load_dotenv
 
 from groq import AsyncGroq
@@ -25,31 +27,49 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
 
-class ModularBridge:
-    def __init__(self):
+# Voice IDs
+# Incoming (EN->ES): Generic Spanish Voice (Sonic Multilingual supports it)
+# Outgoing (ES->EN): Cloned Voice ID (User provided)
+VOICE_ID_OUTGOING = os.getenv("VOICE_ID_OUTGOING", "a0e99841-438c-4a64-b679-ae501e7d6091") # Default to generic if missing
+VOICE_ID_INCOMING = "a0e99841-438c-4a64-b679-ae501e7d6091" # Generic Sonic ID
+
+class TranslationPipeline:
+    def __init__(self, name, input_device_name, output_device_name, stt_lang, llm_prompt, tts_voice_id):
+        self.name = name
+        self.input_device_name = input_device_name
+        self.output_device_name = output_device_name
+        self.stt_lang = stt_lang
+        self.llm_prompt = llm_prompt
+        self.tts_voice_id = tts_voice_id
+        
         self.p = pyaudio.PyAudio()
         self.input_stream = None
         self.output_stream = None
         
-        # Initialize Clients
         self.groq_client = AsyncGroq(api_key=GROQ_API_KEY)
         self.cartesia_client = AsyncCartesia(api_key=CARTESIA_API_KEY)
-        # Deepgram client not needed for manual websocket
         
-        # State
-        self.is_running = True
-        self.input_device_index = self.get_device_index("BlackHole 2ch", is_input=True)
-        self.output_device_index = self.get_output_device_index()
+        self.is_running = False
+        self.input_device_index = self.get_device_index(self.input_device_name, is_input=True)
+        self.output_device_index = self.get_device_index(self.output_device_name, is_input=False)
         
-        # Queues for non-blocking processing
+        # Queues
         self.transcript_queue = asyncio.Queue()
         self.audio_queue = asyncio.Queue()
+        
+        self.log(f"Initialized Pipeline '{self.name}'")
+        self.log(f"  Input: {self.input_device_name} (Index: {self.input_device_index})")
+        self.log(f"  Output: {self.output_device_name} (Index: {self.output_device_index})")
 
-        print(f"Input Device: {self.input_device_index}")
-        print(f"Output Device: {self.output_device_index}")
+    def log(self, message):
+        print(f"[{time.strftime('%H:%M:%S')}][{self.name}] {message}")
 
     def get_device_index(self, name_fragment, is_input=True):
+        if not name_fragment: 
+            return None
+            
         count = self.p.get_device_count()
+        # Try exact match first, then substring
         for i in range(count):
             info = self.p.get_device_info_by_index(i)
             if is_input and info["maxInputChannels"] > 0:
@@ -58,66 +78,57 @@ class ModularBridge:
             elif not is_input and info["maxOutputChannels"] > 0:
                 if name_fragment.lower() in info["name"].lower():
                     return i
-        return None
-
-    def get_output_device_index(self):
-        env_index = os.environ.get("OUTPUT_DEVICE_INDEX")
-        if env_index:
+        
+        if not is_input:
+            # Fallback for output: Default device
             try:
-                return int(env_index)
-            except ValueError:
-                pass
-        
-        idx = self.get_device_index("External Headphones", is_input=False) or \
-              self.get_device_index("Headphones", is_input=False) or \
-              self.get_device_index("MacBook Pro Speakers", is_input=False) or \
-              self.get_device_index("Speakers", is_input=False)
-        
-        if idx is not None:
-            return idx
-
-        try:
-            return self.p.get_default_output_device_info()["index"]
-        except:
-             return None
+                default_idx = self.p.get_default_output_device_info()["index"]
+                self.log(f"Warning: Output device '{name_fragment}' not found. Using default index {default_idx}.")
+                return default_idx
+            except:
+                return None
+        return None
 
     async def start(self):
         if self.input_device_index is None:
-            print("Error: BlackHole 2ch not found. Please install BlackHole.")
+            self.log(f"Error: Input device '{self.input_device_name}' not found.")
             return
 
-        print("Initializing Audio Output...")
-        self.output_stream = self.p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=44100,
-            output=True,
-            output_device_index=self.output_device_index
-        )
-        
-        # Deepgram WebSocket URL
+        self.is_running = True
+
+        # Initialize Output Stream
+        if self.output_device_index is not None:
+            self.output_stream = self.p.open(
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=44100,
+                output=True,
+                output_device_index=self.output_device_index
+            )
+
+        # Deepgram Configuration
         host = "wss://api.deepgram.com"
         path = "/v1/listen"
+        # Deepgram Nova-2 params
         params = (
-            "model=nova-2"
-            "&language=en-US"
+            f"model=nova-2"
+            f"&language={self.stt_lang}"
             "&smart_format=true"
             "&encoding=linear16"
             "&sample_rate=16000"
             "&interim_results=true"
-            "&endpointing=300" 
+            "&endpointing=300"
         )
         url = f"{host}{path}?{params}"
-        headers = {
-            "Authorization": f"Token {DEEPGRAM_API_KEY}"
-        }
+        headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 
-        print(f"Connecting to Deepgram: {url}")
-        
+        self.log(f"Connecting to Deepgram ({self.stt_lang})...")
+
         try:
             async with websockets.connect(url, additional_headers=headers) as ws:
-                print("Deepgram Connected!")
+                self.log("Deepgram Connected!")
 
+                # Open Input Stream
                 self.input_stream = self.p.open(
                     format=FORMAT,
                     channels=CHANNELS,
@@ -126,13 +137,13 @@ class ModularBridge:
                     input_device_index=self.input_device_index,
                     frames_per_buffer=CHUNK
                 )
-                print("Listening... (Speak into BlackHole 2ch)")
-                
-                # Start background tasks
+                self.log("Listening...")
+
+                # Start tasks
                 receive_task = asyncio.create_task(self.receive_loop(ws))
                 process_task = asyncio.create_task(self.processing_loop())
                 playback_task = asyncio.create_task(self.playback_loop())
-                
+
                 try:
                     while self.is_running:
                         data = await asyncio.to_thread(self.input_stream.read, CHUNK, exception_on_overflow=False)
@@ -140,9 +151,8 @@ class ModularBridge:
                             await ws.send(data)
                         else:
                              await asyncio.sleep(0.01)
-
                 finally:
-                    print("Stopping main loop...")
+                    self.log("Stopping loop...")
                     receive_task.cancel()
                     process_task.cancel()
                     playback_task.cancel()
@@ -154,72 +164,64 @@ class ModularBridge:
                         pass
 
         except Exception as e:
-            print(f"Connection Error: {e}")
+            self.log(f"Pipeline Error: {e}")
         finally:
             self.stop()
 
+    def stop(self):
+        self.is_running = False
+        if self.input_stream:
+            try:
+                self.input_stream.stop_stream()
+                self.input_stream.close()
+            except: pass
+        if self.output_stream:
+            try:
+                self.output_stream.stop_stream()
+                self.output_stream.close()
+            except: pass
+        self.p.terminate()
+
     async def receive_loop(self, ws):
-        """
-        Receives JSON responses from Deepgram and pushes valid transcripts to queue.
-        """
         try:
             async for message in ws:
                 try:
                     data = json.loads(message)
-                    
                     if "channel" in data:
                         alternatives = data["channel"].get("alternatives", [])
                         if alternatives:
                             transcript = alternatives[0].get("transcript", "")
                             is_final = data.get("is_final", False)
-                            
                             if transcript and is_final:
-                                print(f"\n[User]: {transcript}")
+                                self.log(f"STT: {transcript}")
                                 await self.transcript_queue.put(transcript)
-                    
-                    if "type" in data and data["type"] == "Metadata":
-                         print(f"Deepgram Metadata: {data}")
-
                 except json.JSONDecodeError:
                     pass
-
-        except websockets.exceptions.ConnectionClosed:
-            print("Deepgram connection closed")
         except Exception as e:
-            print(f"Receive Loop Error: {e}")
-
-    def log(self, message):
-        print(f"[{time.strftime('%H:%M:%S')}] {message}")
+            self.log(f"Receive Error: {e}")
 
     async def processing_loop(self):
-        """
-        Consumes transcripts, translates them, and pushes audio to playback queue.
-        Maintains a persistent connection to Cartesia for lower latency.
-        Uses Streaming Translation to improve TTFB.
-        """
-        import re
-        
         while self.is_running:
             try:
                 self.log("Connecting to Cartesia TTS...")
                 async with self.cartesia_client.tts.websocket_connect() as ws:
                     self.log("Cartesia TTS Connected")
                     
-                    # Start separate receiver task for full duplex
+                    # Receiver Task (Full Duplex)
                     receiver_task = asyncio.create_task(self.cartesia_receive_loop(ws))
                     
                     try:
                         while self.is_running:
                             text = await self.transcript_queue.get()
-                            self.log(f"Processing: '{text}'")
+                            self.log(f"Translating: '{text}'")
                             
                             try:
-                                # 1. Groq Translation (Streaming)
+                                # Groq Translation (Streaming)
                                 stream = await self.groq_client.chat.completions.create(
                                     messages=[
                                         {
                                             "role": "system",
-                                            "content": "Translate the user input from English to Spanish immediately. Output ONLY the Spanish translation."
+                                            "content": self.llm_prompt
                                         },
                                         {
                                             "role": "user",
@@ -233,42 +235,34 @@ class ModularBridge:
                                 )
                                 
                                 buffer = ""
-                                import uuid
-                                turn_context_id = str(uuid.uuid4())
+                                turn_id = str(uuid.uuid4())
                                 
                                 async for chunk in stream:
                                     content = chunk.choices[0].delta.content
                                     if content:
                                         buffer += content
                                         if re.search(r'[.?!,;:]', buffer):
-                                            await self.send_cartesia_payload(ws, buffer, turn_context_id)
+                                            await self.send_cartesia_payload(ws, buffer, turn_id)
                                             buffer = ""
                                 
                                 if buffer.strip():
-                                    await self.send_cartesia_payload(ws, buffer, turn_context_id)
-
-                                self.log("Groq Stream Finished for Turn")
+                                    await self.send_cartesia_payload(ws, buffer, turn_id)
 
                             except Exception as e:
-                                self.log(f"Processing Task Error: {e}")
-                                if "websocket" in str(type(e)).lower() or "connection" in str(e).lower():
-                                    raise e
+                                self.log(f"Processing Error: {e}")
+                                if "websocket" in str(type(e)).lower(): raise e
                             finally:
                                 self.transcript_queue.task_done()
-                    
                     finally:
                         receiver_task.cancel()
-                        try:
-                            await receiver_task
-                        except asyncio.CancelledError:
-                            pass
-
+                        try: await receiver_task
+                        except: pass
             except Exception as e:
-                self.log(f"Cartesia Connection Error (Reconnecting in 2s): {e}")
+                self.log(f"Cartesia Reconnect: {e}")
                 await asyncio.sleep(2)
 
     async def send_cartesia_payload(self, ws, text, context_id):
-        self.log(f"[Groq Stream -> TTS]: {text}")
+        self.log(f"TTS >> {text}")
         output_format = {
             "container": "raw",
             "encoding": "pcm_s16le",
@@ -279,7 +273,7 @@ class ModularBridge:
             "transcript": text,
             "voice": {
                 "mode": "id",
-                "id": "a0e99841-438c-4a64-b679-ae501e7d6091" 
+                "id": self.tts_voice_id
             },
             "output_format": output_format,
             "context_id": context_id,
@@ -293,41 +287,54 @@ class ModularBridge:
                 audio = getattr(chunk, "audio", None)
                 if audio:
                     await self.audio_queue.put(audio)
-                
-                # We don't break on 'done' here because we want to keep listening
-                # for subsequent requests in the persistent connection
-                if getattr(chunk, "done", False):
-                    # self.log("Debug: TTS Chunk Done")
-                    pass
-        except asyncio.CancelledError:
+        except Exception:
             pass
-        except Exception as e:
-            self.log(f"Cartesia Receiver Error: {e}")
 
     async def playback_loop(self):
-        """
-        Consumes audio chunks and plays them.
-        """
         while True:
             audio_data = await self.audio_queue.get()
             try:
                 if self.output_stream:
-                     # Run blocking write in thread
                      await asyncio.to_thread(self.output_stream.write, audio_data)
             except Exception as e:
-                print(f"Playback Error: {e}")
+                self.log(f"Playback Error: {e}")
             finally:
                 self.audio_queue.task_done()
 
-    def stop(self):
-        self.is_running = False
-        if self.input_stream:
-            self.input_stream.stop_stream()
-            self.input_stream.close()
-        if self.output_stream:
-            self.output_stream.stop_stream()
-            self.output_stream.close()
-        self.p.terminate()
+class BiDirectionalBridge:
+    def __init__(self):
+        # Pipeline 1: Incoming (Remote EN -> Local ES)
+        # Input: BlackHole 2ch (System Audio)
+        # Output: Headphones/Default
+        self.incoming = TranslationPipeline(
+            name="INCOMING (EN->ES)",
+            input_device_name="BlackHole 2ch",
+            output_device_name="Headphones", # Fallbacks to default
+            stt_lang="en-US",
+            llm_prompt="Translate English to Spanish. Output ONLY Spanish.",
+            tts_voice_id=VOICE_ID_INCOMING
+        )
+
+        # Pipeline 2: Outgoing (Local ES -> Remote EN)
+        # Input: Microphone
+        # Output: BlackHole 16ch (Virtual Mic for Meet)
+        self.outgoing = TranslationPipeline(
+            name="OUTGOING (ES->EN)",
+            input_device_name="Microphone", # Matches built-in mic usually
+            output_device_name="BlackHole 16ch",
+            stt_lang="es",
+            llm_prompt="Translate Spanish to English. Output ONLY English.",
+            tts_voice_id=VOICE_ID_OUTGOING
+        )
+
+    async def start(self):
+        print("Starting Bi-Directional Translation Bridge...")
+        
+        # Run both pipelines concurrently
+        await asyncio.gather(
+            self.incoming.start(),
+            self.outgoing.start()
+        )
 
 if __name__ == "__main__":
     if not all([DEEPGRAM_API_KEY, GROQ_API_KEY, CARTESIA_API_KEY]):
@@ -335,7 +342,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        bridge = ModularBridge()
+        bridge = BiDirectionalBridge()
         asyncio.run(bridge.start())
     except KeyboardInterrupt:
         print("\nStopping...")
