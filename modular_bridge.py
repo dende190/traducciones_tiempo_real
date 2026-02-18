@@ -242,11 +242,15 @@ class TranslationPipeline:
                                     if content:
                                         buffer += content
                                         if re.search(r'[.?!,;:]', buffer):
-                                            await self.send_cartesia_payload(ws, buffer, turn_id)
+                                            await self.send_cartesia_payload(ws, buffer, turn_id, continue_stream=True)
                                             buffer = ""
                                 
                                 if buffer.strip():
-                                    await self.send_cartesia_payload(ws, buffer, turn_id)
+                                    await self.send_cartesia_payload(ws, buffer, turn_id, continue_stream=False)
+                                else:
+                                    # If buffer empty but stream ended, we might want to signal end?
+                                    # But we can't send empty transcript. 
+                                    pass
 
                             except Exception as e:
                                 self.log(f"Processing Error: {e}")
@@ -261,8 +265,8 @@ class TranslationPipeline:
                 self.log(f"Cartesia Reconnect: {e}")
                 await asyncio.sleep(2)
 
-    async def send_cartesia_payload(self, ws, text, context_id):
-        self.log(f"TTS >> {text}")
+    async def send_cartesia_payload(self, ws, text, context_id, continue_stream=True):
+        self.log(f"TTS >> {text} (continue={continue_stream})")
         output_format = {
             "container": "raw",
             "encoding": "pcm_s16le",
@@ -277,7 +281,7 @@ class TranslationPipeline:
             },
             "output_format": output_format,
             "context_id": context_id,
-            "continue": True
+            "continue": continue_stream
         }
         await ws.send(payload)
 
@@ -286,15 +290,17 @@ class TranslationPipeline:
             async for chunk in ws:
                 audio = getattr(chunk, "audio", None)
                 if audio:
+                    # self.log(f"Received Audio Chunk: {len(audio)} bytes")
                     await self.audio_queue.put(audio)
-        except Exception:
-            pass
+        except Exception as e:
+            self.log(f"Cartesia Receiver Error: {e}")
 
     async def playback_loop(self):
         while True:
             audio_data = await self.audio_queue.get()
             try:
                 if self.output_stream:
+                     # self.log(f"Playing Chunk: {len(audio_data)} bytes")
                      await asyncio.to_thread(self.output_stream.write, audio_data)
             except Exception as e:
                 self.log(f"Playback Error: {e}")
