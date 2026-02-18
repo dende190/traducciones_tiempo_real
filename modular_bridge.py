@@ -205,72 +205,75 @@ class ModularBridge:
                 async with self.cartesia_client.tts.websocket_connect() as ws:
                     self.log("Cartesia TTS Connected")
                     
-                    while self.is_running:
-                        text = await self.transcript_queue.get()
-                        self.log(f"Processing: '{text}'")
-                        
+                    # Start separate receiver task for full duplex
+                    receiver_task = asyncio.create_task(self.cartesia_receive_loop(ws))
+                    
+                    try:
+                        while self.is_running:
+                            text = await self.transcript_queue.get()
+                            self.log(f"Processing: '{text}'")
+                            
+                            try:
+                                # 1. Groq Translation (Streaming)
+                                stream = await self.groq_client.chat.completions.create(
+                                    messages=[
+                                        {
+                                            "role": "system",
+                                            "content": "Translate the user input from English to Spanish immediately. Output ONLY the Spanish translation."
+                                        },
+                                        {
+                                            "role": "user",
+                                            "content": text,
+                                        }
+                                    ],
+                                    model="llama-3.1-8b-instant",
+                                    temperature=0.3,
+                                    max_tokens=1024,
+                                    stream=True,
+                                )
+                                
+                                buffer = ""
+                                import uuid
+                                turn_context_id = str(uuid.uuid4())
+                                
+                                async for chunk in stream:
+                                    content = chunk.choices[0].delta.content
+                                    if content:
+                                        buffer += content
+                                        if re.search(r'[.?!,;:]', buffer):
+                                            await self.send_cartesia_payload(ws, buffer, turn_context_id)
+                                            buffer = ""
+                                
+                                if buffer.strip():
+                                    await self.send_cartesia_payload(ws, buffer, turn_context_id)
+
+                                self.log("Groq Stream Finished for Turn")
+
+                            except Exception as e:
+                                self.log(f"Processing Task Error: {e}")
+                                if "websocket" in str(type(e)).lower() or "connection" in str(e).lower():
+                                    raise e
+                            finally:
+                                self.transcript_queue.task_done()
+                    
+                    finally:
+                        receiver_task.cancel()
                         try:
-                            # 1. Groq Translation (Streaming)
-                            stream = await self.groq_client.chat.completions.create(
-                                messages=[
-                                    {
-                                        "role": "system",
-                                        "content": "Translate the user input from English to Spanish immediately. Output ONLY the Spanish translation."
-                                    },
-                                    {
-                                        "role": "user",
-                                        "content": text,
-                                    }
-                                ],
-                                model="llama-3.1-8b-instant",
-                                temperature=0.3,
-                                max_tokens=1024,
-                                stream=True,
-                            )
-                            
-                            buffer = ""
-                            import uuid
-                            # Use a unique context for this entire sentence/turn
-                            # This helps Cartesia understand these chunks belong together (if supported)
-                            turn_context_id = str(uuid.uuid4())
-                            
-                            async for chunk in stream:
-                                content = chunk.choices[0].delta.content
-                                if content:
-                                    buffer += content
-                                    # Check for punctuation to flush chunks
-                                    # Flush on: . ? ! , : ;
-                                    if re.search(r'[.?!,;:]', buffer):
-                                        await self.send_to_cartesia(ws, buffer, turn_context_id)
-                                        buffer = ""
-                            
-                            # Flush remaining buffer
-                            if buffer.strip():
-                                await self.send_to_cartesia(ws, buffer, turn_context_id)
-
-                            self.log("Translation & TTS Request Sent for Turn")
-
-                        except Exception as e:
-                            self.log(f"Processing Task Error: {e}")
-                            if "websocket" in str(type(e)).lower() or "connection" in str(e).lower():
-                                raise e
-                        finally:
-                            self.transcript_queue.task_done()
+                            await receiver_task
+                        except asyncio.CancelledError:
+                            pass
 
             except Exception as e:
                 self.log(f"Cartesia Connection Error (Reconnecting in 2s): {e}")
                 await asyncio.sleep(2)
 
-    async def send_to_cartesia(self, ws, text, context_id):
-        """Helper to send text chunk to Cartesia"""
-        self.log(f"[Groq Stream]: {text}")
-        
+    async def send_cartesia_payload(self, ws, text, context_id):
+        self.log(f"[Groq Stream -> TTS]: {text}")
         output_format = {
             "container": "raw",
             "encoding": "pcm_s16le",
             "sample_rate": 44100,
         }
-        
         payload = {
             "model_id": "sonic-multilingual",
             "transcript": text,
@@ -280,27 +283,26 @@ class ModularBridge:
             },
             "output_format": output_format,
             "context_id": context_id,
-            "continue": True # Hint that this is part of a stream
+            "continue": True
         }
-        
         await ws.send(payload)
 
-        # Receive chunks immediately for this segment
-        # Note: If we are pipelining, we might have multiple requests in flight.
-        # But Cartesia websocket is bidirectional. 
-        # Ideally, we should have a separate 'reader' task for the websocket if we want true full-duplex 
-        # (sending next chunk while receiving audio for previous).
-        # However, for now, let's await the response for this chunk to keep order simple.
-        # Wait, if we wait for 'done', we block the next Groq chunk.
-        # But 'done' comes fast for short chunks.
-        
-        async for chunk in ws:
-            audio = getattr(chunk, "audio", None)
-            if audio:
-                await self.audio_queue.put(audio)
-            
-            if getattr(chunk, "done", False):
-                break
+    async def cartesia_receive_loop(self, ws):
+        try:
+            async for chunk in ws:
+                audio = getattr(chunk, "audio", None)
+                if audio:
+                    await self.audio_queue.put(audio)
+                
+                # We don't break on 'done' here because we want to keep listening
+                # for subsequent requests in the persistent connection
+                if getattr(chunk, "done", False):
+                    # self.log("Debug: TTS Chunk Done")
+                    pass
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.log(f"Cartesia Receiver Error: {e}")
 
     async def playback_loop(self):
         """
